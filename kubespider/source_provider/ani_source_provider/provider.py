@@ -170,6 +170,9 @@ class AniSourceProvider(provider.SourceProvider):
                     # Pass blacklist Animes
                     if self.check_blacklist(xml_title, blacklist):
                         continue
+                    if i.find('./guid').attrib['isPermaLink'] == 'false':
+                        logging.info(f'Skipping temporary resource %s', item_title)
+                        continue
                     res = Resource(
                         url=i.find('./guid').text,
                         path=self.save_path + (f'/{item_title}' if self.classification_on_directory else ''),
@@ -195,7 +198,7 @@ class AniSourceProvider(provider.SourceProvider):
     def get_anime_info(self, title: str) -> Tuple[str, str]:
         '''Extract info by only REGEX, might be wrong in extreme cases.
         '''
-        pattern = re.compile(r'\[ANi\] (.+?) - (\d+) \[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\.')
+        pattern = re.compile(r'\[ANi\] (.+?) - (\d+) \[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\](\[v\d\])?\.')
         matches = pattern.findall(title)
         try:
             title, episode = matches[0][:2]
