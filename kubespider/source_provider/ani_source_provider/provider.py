@@ -3,16 +3,44 @@
 # encoding:utf-8
 import logging
 import traceback
-
 import xml.etree.ElementTree as ET
 import re
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 from source_provider import provider
 from api import types
 from api.values import Event, Resource
 from utils import helper
 from utils.config_reader import AbsConfigReader
+
+
+DEFAULT_SEASON_MAPPER = {
+    "第二季": 2,
+    "第三季": 3,
+    "第四季": 4,
+    "第五季": 5,
+    "第六季": 6,
+    "第七季": 7,
+    "第八季": 8,
+    "第九季": 9,
+    "第十季": 10,
+}
+ANIME_TITLE_PATTERN = re.compile(
+    r'\[ANi\] (.+?) - (\d+(?:\.5)?) \[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\.'
+)
+SEASON_RENAME_PATTERN = re.compile(r"- (\d+) \[(720P|1080P|4K)\]\[(Baha|Bilibili)\]")
+
+
+@dataclass
+class AnimeReleaseInfo:
+    title: str
+    episode: str
+
+    @property
+    def is_special_episode(self) -> bool:
+        return self.episode.endswith('.5')
+
 
 class AniSourceProvider(provider.SourceProvider):
     '''This provider is to sync resources from ANi API: https://api.ani.rip/ani-download.xml
@@ -37,6 +65,17 @@ class AniSourceProvider(provider.SourceProvider):
         self.custom_category_mapping = {}
         self.season_episode_adjustment = {}
 
+    def _get_custom_season_mapping_rule(self, keyword: str) -> tuple[int, str]:
+        mapping = self.custom_season_mapping.get(keyword)
+        if isinstance(mapping, dict):
+            season = mapping.get('season')
+            reserve_keywords = mapping.get('reserve_keywords', '')
+            if season is None:
+                logging.warning('Invalid custom_season_mapping for %s: missing season field', keyword)
+                return 1, reserve_keywords
+            return season, reserve_keywords
+        return mapping, ''
+
     def get_provider_name(self) -> str:
         return self.provider_name
 
@@ -49,63 +88,64 @@ class AniSourceProvider(provider.SourceProvider):
     def get_download_provider_type(self) -> str:
         return None
 
-    def get_season(self, title: str) -> tuple[int, str]:
+    def get_season(self, title: str) -> tuple[int, Optional[str], str]:
         season = 1
         keyword = None
-        mapper = {
-            "第二季": 2,
-            "第三季": 3,
-            "第四季": 4,
-            "第五季": 5,
-            "第六季": 6,
-            "第七季": 7,
-            "第八季": 8,
-            "第九季": 9,
-            "第十季": 10
-        }
-        # The user-defined season_mapping has higher priority
-        for kw, s in mapper.items():
+        reserve_keywords = ''
+        for kw, value in DEFAULT_SEASON_MAPPER.items():
             if kw in title:
-                season = s
+                season = value
                 keyword = kw
-        for kw, s in self.custom_season_mapping.items():
+        for kw in self.custom_season_mapping:
             if kw in title:
-                season = s
+                season, reserve_keywords = self._get_custom_season_mapping_rule(kw)
                 keyword = kw
+        return season, keyword, reserve_keywords
 
-        return season, keyword
+    def replace_keyword(self, title: str, keyword: Optional[str], reserve_keywords: str = '') -> str:
+        if not keyword:
+            return title
+        replacement = f" {reserve_keywords}" if reserve_keywords else ""
+        return title.replace(f" {keyword}", replacement)
 
-    def rename_season(self, title: str, season: int, keyword: str, episode: str) -> str:
-        # Add Season Perfix
-        new_title = title.replace(f" {keyword}", "")
-        regex_pattern = r"- (\d+) \[(720P|1080P|4K)\]\[(Baha|Bilibili)\]"
+    def get_adjusted_episode(self, title: str, season: int, episode: str) -> str:
+        adjusted_episode = int(episode)
+        for target_title, season_mapping in self.season_episode_adjustment.items():
+            if target_title in title and season in season_mapping:
+                adjusted_episode += season_mapping[season]
+        return str(adjusted_episode).zfill(2)
+
+    def rename_season(
+        self,
+        title: str,
+        season: int,
+        keyword: Optional[str],
+        episode: str,
+        reserve_keywords: str = ''
+    ) -> str:
         season_ = str(season).zfill(2)
-        # Apply Episode Adjustment
-        e_ = int(episode)
-        for t in self.season_episode_adjustment:
-            if t in title:
-                for s in self.season_episode_adjustment[t]:
-                    if s == season:
-                        episode = str(e_ + self.season_episode_adjustment[t][s]).zfill(2)
+        normalized_title = self.replace_keyword(title, keyword, reserve_keywords)
+        adjusted_episode = self.get_adjusted_episode(title, season, episode)
+        return SEASON_RENAME_PATTERN.sub(
+            rf"- S{season_}E{adjusted_episode} [\2][\3]",
+            normalized_title
+        )
 
-        output = re.sub(regex_pattern, rf"- S{season_}E{episode} [\2][\3]", new_title)
-        return output
-
-    def get_subcategory(self, title: str, season: int, keyword: str) -> str:
+    def get_subcategory(self, title: str, season: int, keyword: Optional[str]) -> str:
         # Custom subcategory mapping will cover any generated data
-        for x in self.custom_category_mapping:
-            if x in title:
-                return self.custom_category_mapping[x]
+        for mapped_keyword, category in self.custom_category_mapping.items():
+            if mapped_keyword in title:
+                return category
         # Avoid '/' appear in original Anime title
         # This will be misleading for qbittorrent
         sub_category = title.replace('/', '_')
         if ' - ' in title:
             # Drop English Title
             sub_category = sub_category.split(' - ')[-1]
-        if season > 1:
+        if season > 1 and keyword:
             # Add Season subcategory
-            s_ = str(season).zfill(2)
-            sub_category = sub_category.replace(f" {keyword}", '') + f"/Season {s_}"
+            season_ = str(season).zfill(2)
+            sub_category = sub_category.replace(f" {keyword}", '') + f"/Season {season_}"
         # According to qbittorrent issue 19941
         # The Windows/linux illegal symbol of path will be automatically replaced with ' '
         # But if the last char of category string is illegal symbol
@@ -117,6 +157,72 @@ class AniSourceProvider(provider.SourceProvider):
         if sub_category[0] == ' ':
             sub_category = sub_category[1:]
         return sub_category
+
+    def should_skip_release(self, xml_title: str, blacklist: list[str], release_info: Optional[AnimeReleaseInfo]) -> bool:
+        if release_info is None:
+            return True
+        if self.check_blacklist(xml_title, blacklist):
+            return True
+        if release_info.is_special_episode:
+            logging.info('Skip special episode by default: %s', xml_title)
+            return True
+        return False
+
+    def normalize_resource_url(self, url: str) -> str:
+        if 'resources.ani.rip' not in url:
+            return url
+        return url.replace('resources.ani.rip', 'cloud.ani-download.workers.dev')
+
+    def build_resource(
+        self,
+        xml_title: str,
+        anime_info: AnimeReleaseInfo,
+        season: int,
+        season_keyword: Optional[str],
+        reserve_keywords: str,
+        final_url: str,
+    ) -> Resource:
+        resource = Resource(
+            url=final_url,
+            path=self.save_path + (f'/{anime_info.title}' if self.classification_on_directory else ''),
+            file_type=types.FILE_TYPE_VIDEO_TV,
+            link_type=self.get_link_type(),
+        )
+
+        if self.api_type == 'torrent' and self.use_sub_category:
+            sub_category = self.get_subcategory(anime_info.title, season, season_keyword)
+            logging.info('Using subcategory: %s', sub_category)
+            resource.put_extra_params({'sub_category': sub_category})
+
+        file_name = xml_title
+        if season > 1:
+            file_name = self.rename_season(
+                xml_title,
+                season,
+                season_keyword,
+                anime_info.episode,
+                reserve_keywords,
+            )
+        resource.put_extra_params({'file_name': file_name})
+        return resource
+
+    def parse_resource_item(self, item: ET.Element, blacklist: list[str]) -> Optional[Resource]:
+        xml_title = item.findtext('./title')
+        anime_info = self.get_anime_info(xml_title)
+        if self.should_skip_release(xml_title, blacklist, anime_info):
+            return None
+
+        season, season_keyword, reserve_keywords = self.get_season(xml_title)
+        logging.info('Found Anime "%s" Season %s Episode %s', anime_info.title, season, anime_info.episode)
+        final_url = self.normalize_resource_url(item.findtext('./guid'))
+        return self.build_resource(
+            xml_title,
+            anime_info,
+            season,
+            season_keyword,
+            reserve_keywords,
+            final_url,
+        )
 
     def get_prefer_download_provider(self) -> list:
         downloader_names = self.config_reader.read().get('downloader', None)
@@ -158,58 +264,27 @@ class AniSourceProvider(provider.SourceProvider):
 
     def get_links_from_xml(self, tmp_xml, blacklist) -> list[Resource]:
         try:
-            ret = []
+            resources = []
             for item in ET.parse(tmp_xml).findall('.//item'):
-                xml_title = item.find('./title').text
-                item_title, item_episode = self.get_anime_info(xml_title)
-                
-                if item_title is None or self.check_blacklist(xml_title, blacklist):
-                    continue
-                    
-                season, season_keyword = self.get_season(xml_title)
-                logging.info('Found Anime "%s" Season %s Episode %s', item_title, season, item_episode)
-                
-                final_url = item.find('./guid').text
-                if 'resources.ani.rip' in final_url:
-                    final_url = final_url.replace('resources.ani.rip', 'cloud.ani-download.workers.dev')
-                
-                res = Resource(
-                    url=final_url,
-                    path=self.save_path + (f'/{item_title}' if self.classification_on_directory else ''),
-                    file_type=types.FILE_TYPE_VIDEO_TV,
-                    link_type=self.get_link_type(),
-                )
-                
-                if self.api_type == 'torrent' and self.use_sub_category:
-                    sub_category = self.get_subcategory(item_title, season, season_keyword)
-                    logging.info("Using subcategory: %s", sub_category)
-                    res.put_extra_params({'sub_category': sub_category})
-                
-                if season > 1:
-                    res.put_extra_params({'file_name': self.rename_season(xml_title, season, season_keyword, item_episode)})
-                else:
-                    res.put_extra_params({'file_name': xml_title})
-                
-                ret.append(res)
-                
-            return ret
+                resource = self.parse_resource_item(item, blacklist)
+                if resource is not None:
+                    resources.append(resource)
+            return resources
         except Exception as err:
             print(traceback.format_exc())
             logging.info('Error while parsing RSS XML: %s', err)
             return []
 
-    def get_anime_info(self, title: str) -> Tuple[str, str]:
+    def get_anime_info(self, title: str) -> Optional[AnimeReleaseInfo]:
         '''Extract info by only REGEX, might be wrong in extreme cases.
         '''
-        pattern = re.compile(r'\[ANi\] (.+?) - (\d+) \[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\.')
-        matches = pattern.findall(title)
-        try:
-            title, episode = matches[0][:2]
-            # extra_info = matches[0][2:]
-            return title, episode
-        except Exception as err:
-            logging.warning('Error while running regex on title %s: %s', title, err)
-            return None, None
+        matches = ANIME_TITLE_PATTERN.match(title)
+        if matches is None:
+            logging.warning('Error while running regex on title %s', title)
+            return None
+        anime_title = matches.group(1)
+        episode = matches.group(2)
+        return AnimeReleaseInfo(title=anime_title, episode=episode)
 
     def load_filter_config(self) -> str:
         filter_ = self.config_reader.read().get('blacklist', None)
