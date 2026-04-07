@@ -1,12 +1,13 @@
 import unittest
 import tempfile
+import os
 
 from source_provider.ani_source_provider.provider import AniSourceProvider
 from utils.config_reader import AbsConfigReader
 
 
 class AniSourceProviderTest(unittest.TestCase):
-    def test_custom_season_mapping_legacy_style(self):
+    def test_season_mapping_legacy(self):
         provider = AniSourceProvider(
             "test",
             MemDictConfigReader({
@@ -29,11 +30,11 @@ class AniSourceProviderTest(unittest.TestCase):
                 season,
                 keyword,
                 '18',
-                reserve_keywords
+                reserve_keywords,
             )
         )
 
-    def test_custom_season_mapping_with_reserve_keywords(self):
+    def test_mapping_with_reserve_words(self):
         provider = AniSourceProvider(
             "test",
             MemDictConfigReader({
@@ -59,11 +60,11 @@ class AniSourceProviderTest(unittest.TestCase):
                 season,
                 keyword,
                 '18',
-                reserve_keywords
+                reserve_keywords,
             )
         )
 
-    def test_special_episode_is_parsed_but_skipped(self):
+    def test_special_episode_skipped(self):
         provider = AniSourceProvider(
             "test",
             MemDictConfigReader({
@@ -98,7 +99,6 @@ class AniSourceProviderTest(unittest.TestCase):
         try:
             resources = provider.get_links_from_xml(tmp_path, [])
         finally:
-            import os
             os.unlink(tmp_path)
 
         self.assertEqual([], resources)

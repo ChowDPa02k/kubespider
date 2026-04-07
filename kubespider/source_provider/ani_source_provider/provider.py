@@ -5,7 +5,6 @@ import logging
 import traceback
 import xml.etree.ElementTree as ET
 import re
-from dataclasses import dataclass
 from typing import Optional
 
 from source_provider import provider
@@ -32,14 +31,21 @@ ANIME_TITLE_PATTERN = re.compile(
 SEASON_RENAME_PATTERN = re.compile(r"- (\d+) \[(720P|1080P|4K)\]\[(Baha|Bilibili)\]")
 
 
-@dataclass
 class AnimeReleaseInfo:
-    title: str
-    episode: str
+    def __init__(self, title: str, episode: str) -> None:
+        self.title = title
+        self.episode = episode
 
     @property
     def is_special_episode(self) -> bool:
         return self.episode.endswith('.5')
+
+
+class SeasonContext:
+    def __init__(self, season: int, keyword: Optional[str], reserve_keywords: str) -> None:
+        self.season = season
+        self.keyword = keyword
+        self.reserve_keywords = reserve_keywords
 
 
 class AniSourceProvider(provider.SourceProvider):
@@ -89,6 +95,10 @@ class AniSourceProvider(provider.SourceProvider):
         return None
 
     def get_season(self, title: str) -> tuple[int, Optional[str], str]:
+        season_context = self._get_season(title)
+        return season_context.season, season_context.keyword, season_context.reserve_keywords
+
+    def _get_season(self, title: str) -> SeasonContext:
         season = 1
         keyword = None
         reserve_keywords = ''
@@ -100,20 +110,29 @@ class AniSourceProvider(provider.SourceProvider):
             if kw in title:
                 season, reserve_keywords = self._get_custom_season_mapping_rule(kw)
                 keyword = kw
-        return season, keyword, reserve_keywords
+        return SeasonContext(season=season, keyword=keyword, reserve_keywords=reserve_keywords)
 
-    def replace_keyword(self, title: str, keyword: Optional[str], reserve_keywords: str = '') -> str:
-        if not keyword:
+    def _replace_keyword(self, title: str, season_context: SeasonContext) -> str:
+        if not season_context.keyword:
             return title
-        replacement = f" {reserve_keywords}" if reserve_keywords else ""
-        return title.replace(f" {keyword}", replacement)
+        replacement = f" {season_context.reserve_keywords}" if season_context.reserve_keywords else ""
+        return title.replace(f" {season_context.keyword}", replacement)
 
-    def get_adjusted_episode(self, title: str, season: int, episode: str) -> str:
+    def _get_adjusted_episode(self, title: str, season: int, episode: str) -> str:
         adjusted_episode = int(episode)
         for target_title, season_mapping in self.season_episode_adjustment.items():
             if target_title in title and season in season_mapping:
                 adjusted_episode += season_mapping[season]
         return str(adjusted_episode).zfill(2)
+
+    def _rename_season(self, title: str, season_context: SeasonContext, episode: str) -> str:
+        season_ = str(season_context.season).zfill(2)
+        normalized_title = self._replace_keyword(title, season_context)
+        adjusted_episode = self._get_adjusted_episode(title, season_context.season, episode)
+        return SEASON_RENAME_PATTERN.sub(
+            rf"- S{season_}E{adjusted_episode} [\2][\3]",
+            normalized_title
+        )
 
     def rename_season(
         self,
@@ -123,15 +142,10 @@ class AniSourceProvider(provider.SourceProvider):
         episode: str,
         reserve_keywords: str = ''
     ) -> str:
-        season_ = str(season).zfill(2)
-        normalized_title = self.replace_keyword(title, keyword, reserve_keywords)
-        adjusted_episode = self.get_adjusted_episode(title, season, episode)
-        return SEASON_RENAME_PATTERN.sub(
-            rf"- S{season_}E{adjusted_episode} [\2][\3]",
-            normalized_title
-        )
+        season_context = SeasonContext(season=season, keyword=keyword, reserve_keywords=reserve_keywords)
+        return self._rename_season(title, season_context, episode)
 
-    def get_subcategory(self, title: str, season: int, keyword: Optional[str]) -> str:
+    def _get_subcategory(self, title: str, season_context: SeasonContext) -> str:
         # Custom subcategory mapping will cover any generated data
         for mapped_keyword, category in self.custom_category_mapping.items():
             if mapped_keyword in title:
@@ -142,10 +156,10 @@ class AniSourceProvider(provider.SourceProvider):
         if ' - ' in title:
             # Drop English Title
             sub_category = sub_category.split(' - ')[-1]
-        if season > 1 and keyword:
+        if season_context.season > 1 and season_context.keyword:
             # Add Season subcategory
-            season_ = str(season).zfill(2)
-            sub_category = sub_category.replace(f" {keyword}", '') + f"/Season {season_}"
+            season_ = str(season_context.season).zfill(2)
+            sub_category = sub_category.replace(f" {season_context.keyword}", '') + f"/Season {season_}"
         # According to qbittorrent issue 19941
         # The Windows/linux illegal symbol of path will be automatically replaced with ' '
         # But if the last char of category string is illegal symbol
@@ -158,7 +172,7 @@ class AniSourceProvider(provider.SourceProvider):
             sub_category = sub_category[1:]
         return sub_category
 
-    def should_skip_release(self, xml_title: str, blacklist: list[str], release_info: Optional[AnimeReleaseInfo]) -> bool:
+    def _should_skip_release(self, xml_title: str, blacklist: list[str], release_info: Optional[AnimeReleaseInfo]) -> bool:
         if release_info is None:
             return True
         if self.check_blacklist(xml_title, blacklist):
@@ -168,18 +182,16 @@ class AniSourceProvider(provider.SourceProvider):
             return True
         return False
 
-    def normalize_resource_url(self, url: str) -> str:
+    def _normalize_resource_url(self, url: str) -> str:
         if 'resources.ani.rip' not in url:
             return url
         return url.replace('resources.ani.rip', 'cloud.ani-download.workers.dev')
 
-    def build_resource(
+    def _build_resource(
         self,
         xml_title: str,
         anime_info: AnimeReleaseInfo,
-        season: int,
-        season_keyword: Optional[str],
-        reserve_keywords: str,
+        season_context: SeasonContext,
         final_url: str,
     ) -> Resource:
         resource = Resource(
@@ -190,37 +202,34 @@ class AniSourceProvider(provider.SourceProvider):
         )
 
         if self.api_type == 'torrent' and self.use_sub_category:
-            sub_category = self.get_subcategory(anime_info.title, season, season_keyword)
+            sub_category = self._get_subcategory(anime_info.title, season_context)
             logging.info('Using subcategory: %s', sub_category)
             resource.put_extra_params({'sub_category': sub_category})
 
         file_name = xml_title
-        if season > 1:
-            file_name = self.rename_season(
-                xml_title,
-                season,
-                season_keyword,
-                anime_info.episode,
-                reserve_keywords,
-            )
+        if season_context.season > 1:
+            file_name = self._rename_season(xml_title, season_context, anime_info.episode)
         resource.put_extra_params({'file_name': file_name})
         return resource
 
-    def parse_resource_item(self, item: ET.Element, blacklist: list[str]) -> Optional[Resource]:
+    def _parse_resource_item(self, item: ET.Element, blacklist: list[str]) -> Optional[Resource]:
         xml_title = item.findtext('./title')
         anime_info = self.get_anime_info(xml_title)
-        if self.should_skip_release(xml_title, blacklist, anime_info):
+        if self._should_skip_release(xml_title, blacklist, anime_info):
             return None
 
-        season, season_keyword, reserve_keywords = self.get_season(xml_title)
-        logging.info('Found Anime "%s" Season %s Episode %s', anime_info.title, season, anime_info.episode)
-        final_url = self.normalize_resource_url(item.findtext('./guid'))
-        return self.build_resource(
+        season_context = self._get_season(xml_title)
+        logging.info(
+            'Found Anime "%s" Season %s Episode %s',
+            anime_info.title,
+            season_context.season,
+            anime_info.episode
+        )
+        final_url = self._normalize_resource_url(item.findtext('./guid'))
+        return self._build_resource(
             xml_title,
             anime_info,
-            season,
-            season_keyword,
-            reserve_keywords,
+            season_context,
             final_url,
         )
 
@@ -266,7 +275,7 @@ class AniSourceProvider(provider.SourceProvider):
         try:
             resources = []
             for item in ET.parse(tmp_xml).findall('.//item'):
-                resource = self.parse_resource_item(item, blacklist)
+                resource = self._parse_resource_item(item, blacklist)
                 if resource is not None:
                     resources.append(resource)
             return resources
