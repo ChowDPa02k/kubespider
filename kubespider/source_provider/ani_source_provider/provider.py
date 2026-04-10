@@ -5,7 +5,7 @@ import logging
 import traceback
 import xml.etree.ElementTree as ET
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from source_provider import provider
 from api import types
@@ -29,6 +29,7 @@ ANIME_TITLE_PATTERN = re.compile(
     r'\[ANi\] (.+?) - (\d+(?:\.5)?) \[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\[(.+?)\]\.'
 )
 SEASON_RENAME_PATTERN = re.compile(r"- (\d+) \[(720P|1080P|4K)\]\[(Baha|Bilibili)\]")
+ONLINE_MAPPINGS_URL = 'https://cdn.jsdelivr.net/gh/ChowDPa02k/ani-tmdb-mapper@main/mappings_kubespider.json'
 
 
 class AnimeReleaseInfo:
@@ -70,6 +71,7 @@ class AniSourceProvider(provider.SourceProvider):
         self.custom_season_mapping = {}
         self.custom_category_mapping = {}
         self.season_episode_adjustment = {}
+        self.online_mappings_url = ONLINE_MAPPINGS_URL
 
     def _get_custom_season_mapping_rule(self, keyword: str) -> tuple[int, str]:
         mapping = self.custom_season_mapping.get(keyword)
@@ -81,6 +83,74 @@ class AniSourceProvider(provider.SourceProvider):
                 return 1, reserve_keywords
             return season, reserve_keywords
         return mapping, ''
+
+    def _normalize_custom_season_mapping(self, mapping: Any) -> dict[str, Any]:
+        if not isinstance(mapping, dict):
+            return {}
+        normalized = {}
+        for keyword, value in mapping.items():
+            if isinstance(value, dict):
+                season = value.get('season')
+                if season is None:
+                    logging.warning('Invalid custom_season_mapping for %s: missing season field', keyword)
+                    continue
+                try:
+                    normalized[keyword] = {
+                        'season': int(season),
+                        'reserve_keywords': str(value.get('reserve_keywords', '')),
+                    }
+                except (TypeError, ValueError):
+                    logging.warning('Invalid custom_season_mapping season for %s: %s', keyword, season)
+                continue
+            try:
+                normalized[keyword] = int(value)
+            except (TypeError, ValueError):
+                logging.warning('Invalid custom_season_mapping season for %s: %s', keyword, value)
+        return normalized
+
+    def _normalize_season_episode_adjustment(self, mapping: Any) -> dict[str, dict[int, int]]:
+        if not isinstance(mapping, dict):
+            return {}
+        normalized = {}
+        for title, season_mapping in mapping.items():
+            if not isinstance(season_mapping, dict):
+                logging.warning('Invalid season_episode_adjustment for %s: %s', title, season_mapping)
+                continue
+            normalized_title_mapping = {}
+            for season, offset in season_mapping.items():
+                try:
+                    normalized_title_mapping[int(season)] = int(offset)
+                except (TypeError, ValueError):
+                    logging.warning(
+                        'Invalid season_episode_adjustment for %s season %s: %s',
+                        title,
+                        season,
+                        offset
+                    )
+            if normalized_title_mapping:
+                normalized[title] = normalized_title_mapping
+        return normalized
+
+    def _load_online_mappings(self) -> dict[str, Any]:
+        try:
+            req = helper.get_request_controller()
+            response = req.get(self.online_mappings_url, timeout=15)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as err:
+            logging.warning('Failed to fetch ani online mappings from %s: %s', self.online_mappings_url, err)
+            return {}
+
+        if not isinstance(payload, dict):
+            logging.warning('Invalid ani online mappings payload: expected dict, got %s', type(payload).__name__)
+            return {}
+
+        return {
+            'custom_season_mapping': self._normalize_custom_season_mapping(payload.get('custom_season_mapping', {})),
+            'season_episode_adjustment': self._normalize_season_episode_adjustment(
+                payload.get('season_episode_adjustment', {})
+            ),
+        }
 
     def get_provider_name(self) -> str:
         return self.provider_name
@@ -124,6 +194,12 @@ class AniSourceProvider(provider.SourceProvider):
             if target_title in title and season in season_mapping:
                 adjusted_episode += season_mapping[season]
         return str(adjusted_episode).zfill(2)
+
+    def _has_episode_adjustment(self, title: str, season: int) -> bool:
+        for target_title, season_mapping in self.season_episode_adjustment.items():
+            if target_title in title and season in season_mapping:
+                return True
+        return False
 
     def _rename_season(self, title: str, season_context: SeasonContext, episode: str) -> str:
         season_ = str(season_context.season).zfill(2)
@@ -207,7 +283,7 @@ class AniSourceProvider(provider.SourceProvider):
             resource.put_extra_params({'sub_category': sub_category})
 
         file_name = xml_title
-        if season_context.season > 1:
+        if season_context.keyword or self._has_episode_adjustment(xml_title, season_context.season):
             file_name = self._rename_season(xml_title, season_context, anime_info.episode)
         resource.put_extra_params({'file_name': file_name})
         return resource
@@ -219,19 +295,25 @@ class AniSourceProvider(provider.SourceProvider):
             return None
 
         season_context = self._get_season(xml_title)
-        logging.info(
-            'Found Anime "%s" Season %s Episode %s',
-            anime_info.title,
-            season_context.season,
-            anime_info.episode
-        )
         final_url = self._normalize_resource_url(item.findtext('./guid'))
-        return self._build_resource(
+        resource = self._build_resource(
             xml_title,
             anime_info,
             season_context,
             final_url,
         )
+        adjusted_episode = anime_info.episode
+        if season_context.keyword or self._has_episode_adjustment(xml_title, season_context.season):
+            adjusted_episode = self._get_adjusted_episode(xml_title, season_context.season, anime_info.episode)
+        logging.info(
+            'Found Anime "%s" Season %s Episode %s -> Adjusted Episode %s, File "%s"',
+            anime_info.title,
+            season_context.season,
+            anime_info.episode,
+            adjusted_episode,
+            resource.extra_param('file_name')
+        )
+        return resource
 
     def get_prefer_download_provider(self) -> list:
         downloader_names = self.config_reader.read().get('downloader', None)
@@ -325,6 +407,19 @@ class AniSourceProvider(provider.SourceProvider):
         self.rss_link_torrent = cfg.get('rss_link_torrent')
         self.use_sub_category = cfg.get('use_sub_category', False)
         self.classification_on_directory = cfg.get('classification_on_directory', True)
-        self.custom_season_mapping = cfg.get('custom_season_mapping', {})
+        online_mappings = self._load_online_mappings()
+        online_custom_season_mapping = online_mappings.get('custom_season_mapping', {})
+        online_season_episode_adjustment = online_mappings.get('season_episode_adjustment', {})
+        user_custom_season_mapping = self._normalize_custom_season_mapping(cfg.get('custom_season_mapping', {}))
+        user_season_episode_adjustment = self._normalize_season_episode_adjustment(
+            cfg.get('season_episode_adjustment', {})
+        )
+        self.custom_season_mapping = {
+            **online_custom_season_mapping,
+            **user_custom_season_mapping,
+        }
         self.custom_category_mapping = cfg.get('custom_category_mapping', {})
-        self.season_episode_adjustment = cfg.get('season_episode_adjustment', {})
+        self.season_episode_adjustment = {
+            **online_season_episode_adjustment,
+            **user_season_episode_adjustment,
+        }
