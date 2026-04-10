@@ -18,7 +18,12 @@ ANi Project是一个全自动下载流媒体网站（[动画疯](https://ani.gam
 - 自动解析番剧名，识别Season和Episode，并保存为Jellyfin / Emby可直接刮削的文件名格式
 - [仅限Torrent API]支持qBittorrent的子分类特性，更好地管理剧集结构
 - 支持手动映射Season，以识别类似“石之海篇”、“不灭钻石篇”等非常规Season名，默认识别关键词`第*季`
+- 内置在线映射库，会自动合并由 LLM 维护的 ANi/TMDB 映射数据，优先级为`source_provider.yaml`用户定义 > 在线映射 > 内置简单自动解析
 - [仅限直链API] 支持对集数进行修正，以应对Ani源与TMDB等海外媒体库集号不一致的情况
+
+## 数据来源
+
+在线映射库数据来源于项目 [ChowDPa02k/ani-tmdb-mapper](https://github.com/ChowDPa02k/ani-tmdb-mapper)。
 
 ## 配置手册
 
@@ -52,8 +57,8 @@ ani_source_provider:
 * `rss_link_torrent`：ANi的Torrent API地址，默认已经填好。
 * `classification_on_directory`：是否按照番剧名分文件夹保存。启用该项有助于Emby/Jellyfin等媒体服务器刮削。
 * `blacklist`：黑名单，可以是`list`或者`str`，在黑名单中的番剧将不会被下载。黑名单使用纯字符串匹配，**不支持正则表达式**，为空时默认下载所有番剧。
-* `custom_season_mapping`：季映射，通过关键字识别映射Season。支持简写 `keyword: season`，也支持对象写法 `keyword: { season: 2, reserve_keywords: "..." }`，后者可在重命名文件时将命中的关键字替换为指定文本而不是直接删除。
-* `season_episode_adjustment`：集数修正，格式请参考`source_provier.yaml`中的注释或者下方的最佳实践。
+* `custom_season_mapping`：季映射，通过关键字识别映射Season。支持简写 `keyword: season`，也支持对象写法 `keyword: { season: 2, reserve_keywords: "..." }`，后者可在重命名文件时将命中的关键字替换为指定文本而不是直接删除。若与在线映射冲突，以用户配置为准。
+* `season_episode_adjustment`：集数修正，格式请参考`source_provier.yaml`中的注释或者下方的最佳实践。若与在线映射冲突，以用户配置为准。
 * `download_param.tags`：提交给qBittorrent的tags。
 * `download_param.category`：提交给qBittorrent的分类。
 * `use_sub_category`：qBittorrent的子分类支持，有助于高效管理番剧内容。
